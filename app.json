@@ -12,7 +12,13 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "This app uses Bluetooth to communicate with BikeESP device",
+        "NSBluetoothPeripheralUsageDescription": "This app uses Bluetooth to communicate with BikeESP device",
+        "NSLocationWhenInUseUsageDescription": "This app uses your location to show nearby roads on the ESP32 display"
+      },
+      "bundleIdentifier": "com.anonymous.BikeApp"
     },
     "android": {
       "adaptiveIcon": {
@@ -21,10 +27,42 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "ACCESS_FINE_LOCATION",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT"
+      ],
+      "package": "com.anonymous.BikeApp"
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "This app uses your location to show nearby roads on the ESP32 display"
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 23
+          }
+        }
+      ],
+      "expo-sharing"
+    ]
   }
 }
