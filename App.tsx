@@ -13,9 +13,12 @@ import {
   ActivityIndicator,
   Modal,
   ScrollView,
+  AppState,
+  AppStateStatus,
 } from "react-native";
 import { BleManager, Device } from "react-native-ble-plx";
 import * as Location from "expo-location";
+import * as TaskManager from "expo-task-manager";
 import { Buffer } from "buffer";
 
 const SERVICE_UUID = "12345678-1234-1234-1234-123456789abc";
@@ -30,6 +33,8 @@ const REFETCH_DISTANCE_M = 2;
 const ZOOM_LEVELS = [50, 100, 200, 400, 800];
 const DEFAULT_ZOOM_INDEX = 2;
 const SPEED_THRESHOLD_MS = 1.0; // below this m/s → show 0
+
+const BACKGROUND_LOCATION_TASK = "background-location-task";
 
 type ConnectionState = "disconnected" | "scanning" | "connecting" | "connected";
 type RideState = "idle" | "recording" | "paused";
@@ -116,14 +121,108 @@ function stripDiacritics(str: string): string {
   return str.replace(/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/g, (c) => map[c] || c);
 }
 
+// --- Background task module-level state ---
+let bgBleDevice: Device | null = null;
+let bgTrackPoints: TrackPoint[] = [];
+let bgRideState: RideState = "idle";
+let bgRideStartTime = 0;
+let bgRidePausedTime = 0;
+let bgRidePauseStart = 0;
+
+// Background location task
+TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
+  if (error) {
+    console.error("Background location error:", error);
+    return;
+  }
+  if (!data) return;
+
+  const { locations } = data as { locations: Location.LocationObject[] };
+  if (!locations || locations.length === 0) return;
+
+  const location = locations[locations.length - 1];
+  const { latitude, longitude, altitude, speed } = location.coords;
+
+  // Record track point if recording
+  if (bgRideState === "recording") {
+    bgTrackPoints.push({
+      lat: latitude,
+      lon: longitude,
+      ele: altitude ?? 0,
+      time: new Date().toISOString(),
+      speed: Math.max(0, speed ?? 0),
+    });
+  }
+
+  // Send speed via BLE if connected
+  if (bgBleDevice) {
+    try {
+      const rawSpeed = Math.max(0, speed ?? 0);
+      const speedKmh =
+        rawSpeed < SPEED_THRESHOLD_MS ? "0.0" : (rawSpeed * 3.6).toFixed(1);
+      const encoded = Buffer.from(
+        stripDiacritics(`SP:${speedKmh}`),
+        "utf-8"
+      ).toString("base64");
+      await bgBleDevice.writeCharacteristicWithResponseForService(
+        SERVICE_UUID,
+        CHARACTERISTIC_UUID,
+        encoded
+      );
+
+      // Send ride stats if recording/paused
+      if (bgRideState === "recording" || bgRideState === "paused") {
+        const pts = bgTrackPoints;
+        let dist = 0;
+        for (let i = 1; i < pts.length; i++) {
+          dist += haversineDistance(
+            pts[i - 1].lat,
+            pts[i - 1].lon,
+            pts[i].lat,
+            pts[i].lon
+          );
+        }
+        const now = Date.now();
+        const totalPaused =
+          bgRidePausedTime +
+          (bgRideState === "paused" ? now - bgRidePauseStart : 0);
+        const elapsedMs = now - bgRideStartTime - totalPaused;
+        const elapsedS = Math.max(0, Math.floor(elapsedMs / 1000));
+        const hours = Math.floor(elapsedS / 3600);
+        const mins = Math.floor((elapsedS % 3600) / 60);
+        const secs = elapsedS % 60;
+        const timeStr =
+          hours > 0
+            ? `${hours}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
+            : `${mins}:${String(secs).padStart(2, "0")}`;
+        const distKm = dist / 1000;
+        const elapsedHours = elapsedMs / 3600000;
+        const avg = elapsedHours > 0.001 ? distKm / elapsedHours : 0;
+
+        const statsEncoded = Buffer.from(
+          `RS:${distKm.toFixed(1)},${timeStr},${avg.toFixed(0)}`,
+          "utf-8"
+        ).toString("base64");
+        await bgBleDevice.writeCharacteristicWithResponseForService(
+          SERVICE_UUID,
+          CHARACTERISTIC_UUID,
+          statsEncoded
+        );
+      }
+    } catch (e) {
+      // BLE send failed in background — ignore
+    }
+  }
+});
+
 export default function App() {
   const bleManager = useRef(new BleManager()).current;
   const [connectionState, setConnectionState] =
     useState<ConnectionState>("disconnected");
   const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
-  const [text, setText] = useState("");
   const [log, setLog] = useState<string[]>([]);
   const [mapActive, setMapActive] = useState(false);
+  const [trackingActive, setTrackingActive] = useState(false);
   const [zoomIndex, setZoomIndex] = useState(DEFAULT_ZOOM_INDEX);
 
   // GPX route
@@ -154,6 +253,7 @@ export default function App() {
   const lastSentSegments = useRef<Segment[]>([]);
   const rotationInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const positionInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const trackingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const deviceRef = useRef<Device | null>(null);
   const sendingRef = useRef(false);
   const zoomRef = useRef(DEFAULT_ZOOM_INDEX);
@@ -168,6 +268,7 @@ export default function App() {
 
   useEffect(() => {
     deviceRef.current = connectedDevice;
+    bgBleDevice = connectedDevice;
   }, [connectedDevice]);
 
   useEffect(() => {
@@ -177,13 +278,30 @@ export default function App() {
 
   useEffect(() => {
     rideStateRef.current = rideState;
+    bgRideState = rideState;
   }, [rideState]);
+
+  // AppState listener: sync background state back to foreground
+  useEffect(() => {
+    const handleAppStateChange = (nextAppState: AppStateStatus) => {
+      if (nextAppState === "active") {
+        // Sync background track points back
+        if (bgTrackPoints.length > trackPoints.current.length) {
+          trackPoints.current = [...bgTrackPoints];
+        }
+      }
+    };
+
+    const sub = AppState.addEventListener("change", handleAppStateChange);
+    return () => sub.remove();
+  }, []);
 
   useEffect(() => {
     return () => {
       headingSub.current?.remove();
       if (rotationInterval.current) clearInterval(rotationInterval.current);
       if (positionInterval.current) clearInterval(positionInterval.current);
+      if (trackingIntervalRef.current) clearInterval(trackingIntervalRef.current);
       bleManager.destroy();
     };
   }, []);
@@ -296,27 +414,12 @@ export default function App() {
 
   const disconnect = async () => {
     stopMapUpdates();
+    await stopTracking();
     if (connectedDevice) {
       await connectedDevice.cancelConnection();
       setConnectedDevice(null);
       setConnectionState("disconnected");
       addLog("Disconnected");
-    }
-  };
-
-  const sendText = async () => {
-    if (!connectedDevice || !text.trim()) return;
-    try {
-      const encoded = Buffer.from(stripDiacritics(text), "utf-8").toString("base64");
-      await connectedDevice.writeCharacteristicWithResponseForService(
-        SERVICE_UUID,
-        CHARACTERISTIC_UUID,
-        encoded
-      );
-      addLog(`Sent: "${text}"`);
-      setText("");
-    } catch (e: any) {
-      addLog(`Send failed: ${e.message}`);
     }
   };
 
@@ -328,6 +431,183 @@ export default function App() {
       CHARACTERISTIC_UUID,
       encoded
     );
+  };
+
+  // --- Tracking (GPS + speed, independent of map) ---
+
+  const sendTrackingUpdate = async () => {
+    const device = deviceRef.current;
+    if (!device) return;
+
+    try {
+      const location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
+      });
+      const { latitude, longitude, altitude, speed } = location.coords;
+      currentPos.current = { lat: latitude, lon: longitude };
+      currentSpeed.current = Math.max(0, speed ?? 0);
+
+      // Ride tracking
+      if (rideStateRef.current === "recording") {
+        const pt: TrackPoint = {
+          lat: latitude,
+          lon: longitude,
+          ele: altitude ?? 0,
+          time: new Date().toISOString(),
+          speed: Math.max(0, speed ?? 0),
+        };
+        trackPoints.current.push(pt);
+        bgTrackPoints.push(pt);
+      }
+
+      // Send speed
+      const rawSpeed = currentSpeed.current;
+      const speedKmh =
+        rawSpeed < SPEED_THRESHOLD_MS ? "0.0" : (rawSpeed * 3.6).toFixed(1);
+      await bleSend(device, `SP:${speedKmh}`);
+
+      // Send ride stats if recording or paused
+      if (
+        rideStateRef.current === "recording" ||
+        rideStateRef.current === "paused"
+      ) {
+        const stats = computeRideStats();
+        await bleSend(
+          device,
+          `RS:${stats.dist.toFixed(1)},${stats.time},${stats.avg.toFixed(0)}`
+        );
+      }
+    } catch (e: any) {
+      addLog(`Tracking error: ${e.message}`);
+    }
+  };
+
+  const startTracking = async () => {
+    // Request foreground location permission
+    const { status: fgStatus } =
+      await Location.requestForegroundPermissionsAsync();
+    if (fgStatus !== "granted") {
+      Alert.alert("Error", "Location permission is required for tracking");
+      return;
+    }
+
+    // Request background location permission
+    const { status: bgStatus } =
+      await Location.requestBackgroundPermissionsAsync();
+    if (bgStatus !== "granted") {
+      addLog("Background location not granted — foreground only");
+    }
+
+    // Start ride recording
+    trackPoints.current = [];
+    bgTrackPoints = [];
+    rideStartTime.current = Date.now();
+    bgRideStartTime = Date.now();
+    ridePausedTime.current = 0;
+    bgRidePausedTime = 0;
+    setRideState("recording");
+    sendRideState("recording");
+
+    // Start heading watch
+    headingSub.current = await Location.watchHeadingAsync((heading) => {
+      currentHeading.current = heading.trueHeading ?? heading.magHeading ?? 0;
+      triggerRotationUpdate.current();
+    });
+
+    // Send MM:0 to ESP32 (stats-only mode initially)
+    const device = deviceRef.current;
+    if (device) {
+      try {
+        await bleSend(device, "MM:0");
+      } catch {}
+    }
+
+    // Start foreground position/speed interval (3s)
+    await sendTrackingUpdate();
+    trackingIntervalRef.current = setInterval(sendTrackingUpdate, 3000);
+
+    // Start background location updates
+    if (bgStatus === "granted") {
+      try {
+        await Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
+          accuracy: Location.Accuracy.High,
+          timeInterval: 3000,
+          distanceInterval: 5,
+          deferredUpdatesInterval: 3000,
+          showsBackgroundLocationIndicator: true,
+          foregroundService: {
+            notificationTitle: "BikeApp Tracking",
+            notificationBody: "Recording your ride in the background",
+            notificationColor: "#4CAF50",
+          },
+        });
+        addLog("Background tracking started");
+      } catch (e: any) {
+        addLog(`Background task error: ${e.message}`);
+      }
+    }
+
+    setTrackingActive(true);
+    addLog("Tracking started");
+  };
+
+  const stopTracking = async () => {
+    // Stop background location
+    try {
+      const isRegistered = await TaskManager.isTaskRegisteredAsync(
+        BACKGROUND_LOCATION_TASK
+      );
+      if (isRegistered) {
+        await Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+      }
+    } catch {}
+
+    // Stop foreground intervals
+    if (trackingIntervalRef.current) {
+      clearInterval(trackingIntervalRef.current);
+      trackingIntervalRef.current = null;
+    }
+
+    // Stop heading if map is not active
+    if (!mapActive) {
+      headingSub.current?.remove();
+      headingSub.current = null;
+    }
+
+    // Sync background points
+    if (bgTrackPoints.length > trackPoints.current.length) {
+      trackPoints.current = [...bgTrackPoints];
+    }
+
+    // Handle ride stop
+    const pts = trackPoints.current;
+    if (pts.length > 0) {
+      Alert.alert("Stop Tracking", `${pts.length} points recorded`, [
+        {
+          text: "Export GPX",
+          onPress: () => exportRideGpx(),
+        },
+        {
+          text: "Discard",
+          style: "destructive",
+          onPress: () => {
+            trackPoints.current = [];
+            bgTrackPoints = [];
+            setRideState("idle");
+            sendRideState("idle");
+            addLog("Ride discarded");
+          },
+        },
+        { text: "Cancel" },
+      ]);
+    } else {
+      setRideState("idle");
+      sendRideState("idle");
+    }
+
+    setTrackingActive(false);
+    sendingRef.current = false;
+    addLog("Tracking stopped");
   };
 
   // --- Map / Location ---
@@ -519,8 +799,6 @@ export default function App() {
         buf.toString("base64")
       );
     }
-
-    // MR render command moved to sendRotationUpdate (after GPX data)
   };
 
   const sendGpxToDevice = async (device: Device, segments: Segment[]) => {
@@ -549,8 +827,6 @@ export default function App() {
         buf.toString("base64")
       );
     }
-
-    // No GR render command — MR will trigger render for both map+gpx
   };
 
   const sendStreetNames = async (
@@ -735,10 +1011,9 @@ export default function App() {
 
   // Wire up heading-driven rotation trigger
   triggerRotationUpdate.current = () => {
+    if (!mapActive) return; // Only trigger rotation updates when map is active
     const now = Date.now();
-    // Throttle: minimum 500ms between sends
     if (now - lastRotationSendTime.current < 500) return;
-    // Only trigger if heading changed > 3 degrees
     let diff = Math.abs(currentHeading.current - lastSentHeading.current);
     if (diff > 180) diff = 360 - diff;
     if (diff < 3) return;
@@ -759,13 +1034,15 @@ export default function App() {
 
       // Ride tracking
       if (rideStateRef.current === "recording") {
-        trackPoints.current.push({
+        const pt: TrackPoint = {
           lat: latitude,
           lon: longitude,
           ele: altitude ?? 0,
           time: new Date().toISOString(),
           speed: Math.max(0, speed ?? 0),
-        });
+        };
+        trackPoints.current.push(pt);
+        bgTrackPoints.push(pt);
       }
 
       const needFetch =
@@ -794,32 +1071,49 @@ export default function App() {
   };
 
   const startMapUpdates = async () => {
-    const { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== "granted") {
-      Alert.alert("Error", "Location permission is required for map");
-      return;
+    // If tracking not active, request location permission
+    if (!trackingActive) {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") {
+        Alert.alert("Error", "Location permission is required for map");
+        return;
+      }
+    }
+
+    // Send MM:1 to ESP32 (map mode)
+    const device = deviceRef.current;
+    if (device) {
+      try {
+        await bleSend(device, "MM:1");
+      } catch {}
     }
 
     setMapActive(true);
     addLog(`Map started (zoom ${ZOOM_LEVELS[zoomIndex]}m)`);
 
-    headingSub.current = await Location.watchHeadingAsync((heading) => {
-      currentHeading.current = heading.trueHeading ?? heading.magHeading ?? 0;
-      // Trigger near-realtime rotation on significant heading change
-      triggerRotationUpdate.current();
-    });
+    // Start heading if not already from tracking
+    if (!headingSub.current) {
+      headingSub.current = await Location.watchHeadingAsync((heading) => {
+        currentHeading.current = heading.trueHeading ?? heading.magHeading ?? 0;
+        triggerRotationUpdate.current();
+      });
+    }
 
     await sendPositionUpdate();
 
-    // Fallback rotation every 3s (in case heading doesn't change)
+    // Fallback rotation every 3s
     rotationInterval.current = setInterval(sendRotationUpdate, 3000);
     const posInterval = rideStateRef.current === "recording" ? 3000 : 10000;
     positionInterval.current = setInterval(sendPositionUpdate, posInterval);
   };
 
   const stopMapUpdates = () => {
-    headingSub.current?.remove();
-    headingSub.current = null;
+    // Send MM:0 to ESP32 (back to stats-only)
+    const device = deviceRef.current;
+    if (device) {
+      bleSend(device, "MM:0").catch(() => {});
+    }
+
     if (rotationInterval.current) {
       clearInterval(rotationInterval.current);
       rotationInterval.current = null;
@@ -831,11 +1125,17 @@ export default function App() {
     sendingRef.current = false;
     setMapActive(false);
     lastFetchPos.current = null;
-    currentPos.current = null;
     cachedRoads.current = [];
     lastSentSegments.current = [];
     lastSentGpxSegments.current = [];
     forceFullSend.current = true;
+
+    // Only stop heading if tracking is not active
+    if (!trackingActive) {
+      headingSub.current?.remove();
+      headingSub.current = null;
+      currentPos.current = null;
+    }
   };
 
   // --- Ride tracking ---
@@ -849,56 +1149,21 @@ export default function App() {
     }
   };
 
-  const startRide = () => {
-    trackPoints.current = [];
-    rideStartTime.current = Date.now();
-    ridePausedTime.current = 0;
-    setRideState("recording");
-    sendRideState("recording");
-    addLog("Ride recording started");
-    if (positionInterval.current) {
-      clearInterval(positionInterval.current);
-      positionInterval.current = setInterval(sendPositionUpdate, 3000);
-    }
-  };
-
   const pauseRide = () => {
     ridePauseStart.current = Date.now();
+    bgRidePauseStart = Date.now();
     setRideState("paused");
     sendRideState("paused");
     addLog("Ride paused");
   };
 
   const resumeRide = () => {
-    ridePausedTime.current += Date.now() - ridePauseStart.current;
+    const pauseDuration = Date.now() - ridePauseStart.current;
+    ridePausedTime.current += pauseDuration;
+    bgRidePausedTime += pauseDuration;
     setRideState("recording");
     sendRideState("recording");
     addLog("Ride resumed");
-  };
-
-  const stopRide = () => {
-    const pts = trackPoints.current;
-    Alert.alert("Stop Ride", `${pts.length} points recorded`, [
-      {
-        text: "Export GPX",
-        onPress: () => exportRideGpx(),
-      },
-      {
-        text: "Discard",
-        style: "destructive",
-        onPress: () => {
-          trackPoints.current = [];
-          setRideState("idle");
-          sendRideState("idle");
-          addLog("Ride discarded");
-          if (positionInterval.current) {
-            clearInterval(positionInterval.current);
-            positionInterval.current = setInterval(sendPositionUpdate, 10000);
-          }
-        },
-      },
-      { text: "Cancel" },
-    ]);
   };
 
   // Stop ride from ESP32 button — auto-export, no dialog
@@ -908,6 +1173,11 @@ export default function App() {
   };
 
   const exportRideGpx = async () => {
+    // Sync background points
+    if (bgTrackPoints.length > trackPoints.current.length) {
+      trackPoints.current = [...bgTrackPoints];
+    }
+
     const points = trackPoints.current;
     if (points.length === 0) {
       addLog("No points to export");
@@ -953,18 +1223,16 @@ ${points
     }
 
     trackPoints.current = [];
+    bgTrackPoints = [];
     setRideState("idle");
     sendRideState("idle");
-    if (positionInterval.current) {
-      clearInterval(positionInterval.current);
-      positionInterval.current = setInterval(sendPositionUpdate, 10000);
-    }
   };
 
   // Wire up BLE ride command handler (uses refs so always fresh)
   handleBleRideCmd.current = (cmd: string) => {
-    if (cmd === "START") startRide();
-    else if (cmd === "PAUSE") pauseRide();
+    if (cmd === "START") {
+      if (!trackingActive) startTracking();
+    } else if (cmd === "PAUSE") pauseRide();
     else if (cmd === "RESUME") resumeRide();
     else if (cmd === "STOP") stopRideFromEsp();
   };
@@ -1077,34 +1345,22 @@ ${points
         )}
       </View>
 
-      {/* Send Text */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Send to Display</Text>
-        <View style={styles.inputRow}>
-          <TextInput
-            style={styles.input}
-            value={text}
-            onChangeText={setText}
-            placeholder="Type message..."
-            placeholderTextColor="#666"
-            editable={connectionState === "connected"}
-          />
-          <TouchableOpacity
-            style={[
-              styles.sendBtn,
-              connectionState !== "connected" && styles.btnDisabled,
-            ]}
-            onPress={sendText}
-            disabled={connectionState !== "connected" || !text.trim()}
-          >
-            <Text style={styles.btnText}>Send</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      {/* Map Controls */}
+      {/* Tracking + Map Controls */}
       <View style={styles.section}>
         <View style={styles.mapRow}>
+          <TouchableOpacity
+            style={[
+              trackingActive ? styles.stopTrackingBtn : styles.trackingBtn,
+              connectionState !== "connected" && styles.btnDisabled,
+            ]}
+            onPress={trackingActive ? stopTracking : startTracking}
+            disabled={connectionState !== "connected"}
+          >
+            <Text style={styles.btnText}>
+              {trackingActive ? "Stop Tracking" : "Start Tracking"}
+            </Text>
+          </TouchableOpacity>
+
           <TouchableOpacity
             style={[
               mapActive ? styles.stopMapBtn : styles.mapBtn,
@@ -1114,29 +1370,41 @@ ${points
             disabled={connectionState !== "connected"}
           >
             <Text style={styles.btnText}>
-              {mapActive ? "Stop Map" : "Start Map"}
+              {mapActive ? "Stop Map" : "Send Map"}
             </Text>
           </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.zoomBtn, !mapActive && styles.btnDisabled]}
-            onPress={zoomIn}
-            disabled={!mapActive || zoomIndex === 0}
-          >
-            <Text style={styles.zoomBtnText}>+</Text>
-          </TouchableOpacity>
-
-          <Text style={styles.zoomLabel}>{ZOOM_LEVELS[zoomIndex]}m</Text>
-
-          <TouchableOpacity
-            style={[styles.zoomBtn, !mapActive && styles.btnDisabled]}
-            onPress={zoomOut}
-            disabled={!mapActive || zoomIndex === ZOOM_LEVELS.length - 1}
-          >
-            <Text style={styles.zoomBtnText}>-</Text>
-          </TouchableOpacity>
         </View>
+        {trackingActive && rideState !== "idle" && (
+          <Text style={styles.trackingStatus}>
+            {rideState === "recording" ? "REC" : "PAUSED"}
+          </Text>
+        )}
       </View>
+
+      {/* Zoom Controls — only when map is active */}
+      {mapActive && (
+        <View style={styles.section}>
+          <View style={styles.mapRow}>
+            <TouchableOpacity
+              style={styles.zoomBtn}
+              onPress={zoomIn}
+              disabled={zoomIndex === 0}
+            >
+              <Text style={styles.zoomBtnText}>+</Text>
+            </TouchableOpacity>
+
+            <Text style={styles.zoomLabel}>{ZOOM_LEVELS[zoomIndex]}m</Text>
+
+            <TouchableOpacity
+              style={styles.zoomBtn}
+              onPress={zoomOut}
+              disabled={zoomIndex === ZOOM_LEVELS.length - 1}
+            >
+              <Text style={styles.zoomBtnText}>-</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
 
       {/* GPX Routes */}
       <View style={styles.section}>
@@ -1167,60 +1435,6 @@ ${points
             </TouchableOpacity>
           </View>
         )}
-      </View>
-
-      {/* Ride Tracking */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>
-          Ride{" "}
-          {rideState !== "idle" && (
-            <Text style={{ color: rideState === "recording" ? "#4CAF50" : "#FF9800" }}>
-              {rideState === "recording" ? "REC" : "PAUSED"}
-            </Text>
-          )}
-        </Text>
-        <View style={styles.mapRow}>
-          {rideState === "idle" ? (
-            <TouchableOpacity
-              style={[
-                styles.mapBtn,
-                { backgroundColor: "#4CAF50" },
-                !mapActive && styles.btnDisabled,
-              ]}
-              onPress={startRide}
-              disabled={!mapActive}
-            >
-              <Text style={styles.btnText}>Start Ride</Text>
-            </TouchableOpacity>
-          ) : (
-            <>
-              {rideState === "recording" ? (
-                <TouchableOpacity
-                  style={[styles.mapBtn, { backgroundColor: "#FF9800" }]}
-                  onPress={pauseRide}
-                >
-                  <Text style={styles.btnText}>Pause</Text>
-                </TouchableOpacity>
-              ) : (
-                <TouchableOpacity
-                  style={[styles.mapBtn, { backgroundColor: "#4CAF50" }]}
-                  onPress={resumeRide}
-                >
-                  <Text style={styles.btnText}>Resume</Text>
-                </TouchableOpacity>
-              )}
-              <TouchableOpacity
-                style={[
-                  styles.mapBtn,
-                  { backgroundColor: "#F44336", flex: 0.5 },
-                ]}
-                onPress={stopRide}
-              >
-                <Text style={styles.btnText}>Stop</Text>
-              </TouchableOpacity>
-            </>
-          )}
-        </View>
       </View>
 
       {/* Log */}
@@ -1331,6 +1545,20 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 10,
   },
+  trackingBtn: {
+    flex: 1,
+    backgroundColor: "#4CAF50",
+    padding: 14,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  stopTrackingBtn: {
+    flex: 1,
+    backgroundColor: "#F44336",
+    padding: 14,
+    borderRadius: 12,
+    alignItems: "center",
+  },
   mapBtn: {
     flex: 1,
     backgroundColor: "#2196F3",
@@ -1344,6 +1572,13 @@ const styles = StyleSheet.create({
     padding: 14,
     borderRadius: 12,
     alignItems: "center",
+  },
+  trackingStatus: {
+    color: "#4CAF50",
+    fontSize: 12,
+    fontWeight: "bold",
+    textAlign: "center",
+    marginTop: 6,
   },
   zoomBtn: {
     backgroundColor: "#16213e",

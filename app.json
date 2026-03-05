@@ -16,7 +16,9 @@
       "infoPlist": {
         "NSBluetoothAlwaysUsageDescription": "This app uses Bluetooth to communicate with BikeESP device",
         "NSBluetoothPeripheralUsageDescription": "This app uses Bluetooth to communicate with BikeESP device",
-        "NSLocationWhenInUseUsageDescription": "This app uses your location to show nearby roads on the ESP32 display"
+        "NSLocationWhenInUseUsageDescription": "This app uses your location to show nearby roads on the ESP32 display",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "This app needs background location to keep tracking your ride when the phone is locked",
+        "UIBackgroundModes": ["location", "bluetooth-central"]
       },
       "bundleIdentifier": "com.anonymous.BikeApp"
     },
@@ -32,6 +34,9 @@
         "BLUETOOTH_SCAN",
         "BLUETOOTH_CONNECT",
         "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
         "android.permission.BLUETOOTH",
         "android.permission.BLUETOOTH_ADMIN",
         "android.permission.BLUETOOTH_CONNECT"
@@ -45,13 +50,16 @@
       [
         "react-native-ble-plx",
         {
-          "isBackgroundEnabled": false
+          "isBackgroundEnabled": true
         }
       ],
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "This app uses your location to show nearby roads on the ESP32 display"
+          "locationWhenInUsePermission": "This app uses your location to show nearby roads on the ESP32 display",
+          "locationAlwaysAndWhenInUsePermission": "This app needs background location to keep tracking your ride when the phone is locked",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
         }
       ],
       [
